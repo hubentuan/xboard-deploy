@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # XBoard-Distro 持久化部署脚本 - 数据保护增强版
-# 作者: oldfriendme (修复版)
+# 作者: 风萧萧兮 (修复版)
 # 修复: 彻底解决数据丢失问题，init 命令仅重置管理员
 
 set -e
@@ -211,34 +211,50 @@ wait_for_mysql() {
             echo ""
             print_info "仍在等待 MySQL 启动... ($((attempt * 2))/$((max_attempts * 2)) 秒)"
             
+            # 20秒后尝试手动启动
+            if [ $attempt -eq 10 ]; then
+                echo ""
+                print_warn "MySQL 未自动启动，尝试手动启动..."
+                manual_start_mysql
+                echo -n "继续等待"
+            fi
+            
             # 显示 MySQL 日志的最后几行
             if [ $attempt -eq 20 ]; then
                 echo ""
                 print_warn "MySQL 启动时间较长，查看日志:"
                 docker exec ${CONTAINER_NAME} tail -10 /var/log/mysql/error.log 2>/dev/null || \
-                docker exec ${CONTAINER_NAME} tail -10 /var/lib/mysql/*.err 2>/dev/null || \
+                docker exec ${CONTAINER_NAME} find /var/lib/mysql -name "*.err" -exec tail -10 {} \; 2>/dev/null || \
                 echo "  无法读取 MySQL 日志"
                 echo ""
+                echo -n "继续等待"
             fi
         fi
     done
     
     echo ""
     print_error "MySQL 启动超时 (已等待 $((max_attempts * 2)) 秒)"
-    print_error "请检查容器日志: docker logs ${CONTAINER_NAME}"
     
     # 显示详细错误信息
     echo ""
-    print_warn "尝试手动诊断:"
-    echo "1. 查看容器日志:"
-    echo "   docker logs ${CONTAINER_NAME}"
+    print_warn "故障排除步骤:"
+    echo "1. 查看 MySQL 进程:"
+    echo "   docker exec ${CONTAINER_NAME} ps aux | grep mysql"
     echo ""
-    echo "2. 进入容器检查:"
-    echo "   docker exec -it ${CONTAINER_NAME} /bin/ash"
-    echo "   ps aux | grep mysql"
-    echo ""
-    echo "3. 查看 MySQL 日志:"
+    echo "2. 查看 MySQL 错误日志:"
     echo "   docker exec ${CONTAINER_NAME} tail -50 /var/log/mysql/error.log"
+    echo "   或: find /opt/xboard-distro/mysql -name '*.err' -exec cat {} \\;"
+    echo ""
+    echo "3. 检查数据目录权限:"
+    echo "   ls -la /opt/xboard-distro/mysql"
+    echo ""
+    echo "4. 手动进入容器检查:"
+    echo "   docker exec -it ${CONTAINER_NAME} /bin/ash"
+    echo "   rc-service mysql start"
+    echo ""
+    echo "5. 如果数据损坏，重新初始化:"
+    echo "   rm -rf /opt/xboard-distro/mysql/*"
+    echo "   $0 deploy"
     echo ""
     
     return 1
@@ -272,33 +288,62 @@ manual_start_mysql() {
         return 0
     fi
     
-    # 尝试不同的启动方式
-    print_info "方法1: 使用 service 命令启动..."
-    docker exec ${CONTAINER_NAME} service mysql start 2>/dev/null || \
-    docker exec ${CONTAINER_NAME} service mysqld start 2>/dev/null || \
-    docker exec ${CONTAINER_NAME} /etc/init.d/mysql start 2>/dev/null || \
-    docker exec ${CONTAINER_NAME} /etc/init.d/mysqld start 2>/dev/null
+    print_info "方法1: 使用 rc-service (Alpine/OpenRC)..."
+    if docker exec ${CONTAINER_NAME} rc-service mysql start 2>/dev/null || \
+       docker exec ${CONTAINER_NAME} rc-service mysqld start 2>/dev/null || \
+       docker exec ${CONTAINER_NAME} rc-service mariadb start 2>/dev/null; then
+        sleep 5
+        if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
+            print_info "MySQL 启动成功"
+            return 0
+        fi
+    fi
     
-    sleep 5
+    print_info "方法2: 直接启动 mysqld 进程..."
+    # 确保数据目录存在且权限正确
+    docker exec ${CONTAINER_NAME} sh -c "
+        mkdir -p /var/lib/mysql /var/run/mysqld
+        chown -R mysql:mysql /var/lib/mysql /var/run/mysqld
+        chmod 755 /var/run/mysqld
+    " 2>/dev/null
+    
+    # 尝试不同的启动命令
+    docker exec -d ${CONTAINER_NAME} mysqld --user=mysql --datadir=/var/lib/mysql --skip-networking=0 2>/dev/null || \
+    docker exec -d ${CONTAINER_NAME} /usr/bin/mysqld --user=mysql 2>/dev/null || \
+    docker exec -d ${CONTAINER_NAME} /usr/sbin/mysqld --user=mysql 2>/dev/null || \
+    docker exec -d ${CONTAINER_NAME} mysqld_safe --user=mysql 2>/dev/null
+    
+    sleep 8
     
     if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
         print_info "MySQL 启动成功"
         return 0
     fi
     
-    print_info "方法2: 直接启动 mysqld..."
-    docker exec -d ${CONTAINER_NAME} mysqld --user=mysql --datadir=/var/lib/mysql 2>/dev/null || \
-    docker exec -d ${CONTAINER_NAME} /usr/sbin/mysqld --user=mysql 2>/dev/null
-    
-    sleep 5
-    
-    if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-        print_info "MySQL 启动成功"
-        return 0
+    print_info "方法3: 检查是否需要初始化数据库..."
+    # 检查数据库是否需要初始化
+    if [ ! -d "${DATA_ROOT}/mysql/mysql" ]; then
+        print_warn "MySQL 数据目录未初始化，尝试初始化..."
+        docker exec ${CONTAINER_NAME} mysql_install_db --user=mysql --datadir=/var/lib/mysql 2>/dev/null || \
+        docker exec ${CONTAINER_NAME} mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql 2>/dev/null
+        
+        sleep 3
+        
+        # 重新启动
+        docker exec -d ${CONTAINER_NAME} mysqld --user=mysql --datadir=/var/lib/mysql 2>/dev/null
+        sleep 8
+        
+        if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
+            print_info "MySQL 初始化并启动成功"
+            return 0
+        fi
     fi
     
     print_error "MySQL 手动启动失败"
-    print_warn "请查看日志: docker exec ${CONTAINER_NAME} tail -50 /var/log/mysql/error.log"
+    print_warn "详细错误信息:"
+    docker exec ${CONTAINER_NAME} tail -20 /var/log/mysql/error.log 2>/dev/null || \
+    docker exec ${CONTAINER_NAME} cat /var/lib/mysql/*.err 2>/dev/null || \
+    echo "无法读取 MySQL 日志"
     return 1
 }
 
@@ -847,7 +892,7 @@ main() {
             echo ""
             print_step "最近的 MySQL 日志:"
             docker exec ${CONTAINER_NAME} tail -20 /var/log/mysql/error.log 2>/dev/null || \
-            docker exec ${CONTAINER_NAME} tail -20 /var/lib/mysql/*.err 2>/dev/null || \
+            docker exec ${CONTAINER_NAME} find /var/lib/mysql -name "*.err" -exec tail -20 {} \; 2>/dev/null || \
             echo "无法读取 MySQL 日志"
             
             # 检查端口
@@ -862,6 +907,55 @@ main() {
             print_step "检查所有服务..."
             docker exec ${CONTAINER_NAME} ps aux | head -20
             
+            # 检查 OpenRC 服务状态
+            echo ""
+            print_step "检查 OpenRC 服务状态..."
+            docker exec ${CONTAINER_NAME} rc-status 2>/dev/null || echo "rc-status 不可用"
+            
+            ;;
+        fix-mysql)
+            print_step "修复 MySQL 启动问题..."
+            echo ""
+            
+            if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+                print_error "容器未运行"
+                exit 1
+            fi
+            
+            # 停止现有 MySQL 进程
+            print_info "停止现有 MySQL 进程..."
+            docker exec ${CONTAINER_NAME} pkill -9 mysqld 2>/dev/null || true
+            sleep 2
+            
+            # 检查并修复权限
+            print_info "检查并修复数据目录权限..."
+            docker exec ${CONTAINER_NAME} sh -c "
+                mkdir -p /var/lib/mysql /var/run/mysqld /var/log/mysql
+                chown -R mysql:mysql /var/lib/mysql /var/run/mysqld /var/log/mysql
+                chmod 755 /var/run/mysqld
+                chmod 750 /var/lib/mysql
+            "
+            
+            # 检查是否需要初始化
+            if [ ! -f "${DATA_ROOT}/mysql/mysql/user.frm" ] && [ ! -d "${DATA_ROOT}/mysql/mysql" ]; then
+                print_warn "MySQL 数据库未初始化，执行初始化..."
+                docker exec ${CONTAINER_NAME} mysql_install_db --user=mysql --datadir=/var/lib/mysql --force 2>/dev/null || \
+                docker exec ${CONTAINER_NAME} mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql 2>/dev/null
+            fi
+            
+            # 启动 MySQL
+            print_info "启动 MySQL..."
+            manual_start_mysql
+            
+            if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
+                print_info "✓ MySQL 修复成功！"
+            else
+                print_error "✗ MySQL 修复失败"
+                echo ""
+                print_warn "请查看错误日志:"
+                docker exec ${CONTAINER_NAME} tail -30 /var/log/mysql/error.log 2>/dev/null || \
+                docker exec ${CONTAINER_NAME} find /var/lib/mysql -name "*.err" -exec cat {} \; 2>/dev/null
+            fi
             ;;
         stop)
             print_info "停止容器..."
@@ -906,6 +1000,8 @@ main() {
             echo "管理命令:"
             echo "  status       - 查看运行状态和数据情况"
             echo "  verify       - 验证数据完整性（检查用户、订单等）"
+            echo "  diagnose     - 诊断系统问题（MySQL、服务等）"
+            echo "  fix-mysql    - 自动修复 MySQL 启动问题"
             echo "  start        - 启动容器和服务"
             echo "  stop         - 停止容器和服务"
             echo "  restart      - 重启容器和服务"
