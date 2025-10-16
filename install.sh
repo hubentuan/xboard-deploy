@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# XBoard-Distro 持久化部署脚本 - 数据保护增强版
-# 作者: 风萧萧兮 (修复版)
-# 修复: 彻底解决数据丢失问题，init 命令仅重置管理员
+# XBoard-Distro 持久化部署脚本 - 完全修复版
+# 作者: 风萧萧兮 (终极修复版)
+# 修复: 解决 MySQL 启动和命令路径问题
 
 set -e
 
@@ -134,6 +134,7 @@ start_container() {
     docker run -d \
         --name ${CONTAINER_NAME} \
         --restart unless-stopped \
+        --privileged \
         -p ${WEB_PORT}:16443 \
         -p ${REALITY_PORT}:443 \
         -p ${HY2_PORT}:4443/udp \
@@ -147,19 +148,29 @@ start_container() {
         -v ${DATA_ROOT}/config:/opt/config \
         ${IMAGE_NAME} /sbin/init
     
-    print_info "容器启动成功，等待系统服务初始化..."
+    print_info "容器启动成功，等待系统服务完全初始化..."
     
-    # 等待容器完全启动
+    # 等待容器内的 init 系统完全启动
     local wait_time=0
-    while [ $wait_time -lt 15 ]; do
+    local max_wait=30
+    echo -n "等待系统初始化"
+    while [ $wait_time -lt $max_wait ]; do
         if docker exec ${CONTAINER_NAME} test -f /sbin/init 2>/dev/null; then
-            break
+            # 检查 init 系统是否准备就绪
+            if docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -v grep | grep -E 'init|systemd|openrc'" 2>/dev/null; then
+                echo ""
+                print_info "系统初始化完成 (${wait_time}秒)"
+                break
+            fi
         fi
+        echo -n "."
         sleep 1
         wait_time=$((wait_time + 1))
     done
     
-    sleep 3  # 额外等待系统服务启动
+    # 额外等待服务启动
+    print_info "等待系统服务启动..."
+    sleep 10
     
     # 检查容器状态
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
@@ -169,6 +180,22 @@ start_container() {
         docker logs ${CONTAINER_NAME}
         exit 1
     fi
+}
+
+# 获取 MySQL 可执行文件路径
+get_mysql_paths() {
+    # 查找 MySQL 相关命令的实际路径
+    local mysqld_path=$(docker exec ${CONTAINER_NAME} sh -c "find /usr -name mysqld 2>/dev/null | head -1" 2>/dev/null || echo "")
+    local mysql_path=$(docker exec ${CONTAINER_NAME} sh -c "find /usr -name mysql 2>/dev/null | head -1" 2>/dev/null || echo "")
+    local mysqladmin_path=$(docker exec ${CONTAINER_NAME} sh -c "find /usr -name mysqladmin 2>/dev/null | head -1" 2>/dev/null || echo "")
+    
+    if [ -z "$mysqld_path" ]; then
+        mysqld_path=$(docker exec ${CONTAINER_NAME} sh -c "which mysqld 2>/dev/null || which mariadbd 2>/dev/null" || echo "")
+    fi
+    
+    echo "MYSQLD_PATH=${mysqld_path}"
+    echo "MYSQL_PATH=${mysql_path}"
+    echo "MYSQLADMIN_PATH=${mysqladmin_path}"
 }
 
 # 检查数据库是否已初始化
@@ -187,45 +214,78 @@ check_database_initialized() {
 # 等待 MySQL 启动
 wait_for_mysql() {
     print_step "等待 MySQL 服务启动..."
-    local max_attempts=60  # 增加到 60 次 (120秒)
+    local max_attempts=90  # 增加到 90 次 (180秒)
     local attempt=0
     
-    echo -n "正在等待"
+    # 先获取 MySQL 路径
+    print_info "查找 MySQL 可执行文件..."
+    local paths=$(get_mysql_paths)
+    eval "$paths"
+    
+    if [ -z "$MYSQLD_PATH" ]; then
+        print_warn "未找到 mysqld，尝试其他方法..."
+    else
+        print_info "找到 mysqld: $MYSQLD_PATH"
+    fi
+    
+    echo -n "正在等待 MySQL 启动"
     while [ $attempt -lt $max_attempts ]; do
-        # 检查 MySQL 进程是否存在
-        if docker exec ${CONTAINER_NAME} ps aux 2>/dev/null | grep -q "[m]ysqld"; then
-            # 进程存在，尝试连接
-            if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
+        # 多种方式检查 MySQL 是否运行
+        local mysql_running=false
+        
+        # 方法1: 检查进程
+        if docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -v grep | grep -E 'mysqld|mariadbd'" 2>/dev/null; then
+            mysql_running=true
+        fi
+        
+        # 方法2: 尝试连接
+        if [ -n "$MYSQLADMIN_PATH" ]; then
+            if docker exec ${CONTAINER_NAME} sh -c "${MYSQLADMIN_PATH} ping -h localhost --silent" 2>/dev/null; then
+                echo ""
+                print_info "MySQL 服务已就绪 (耗时: $((attempt * 2)) 秒)"
+                return 0
+            fi
+        else
+            # 尝试使用默认路径
+            if docker exec ${CONTAINER_NAME} sh -c "mysqladmin ping -h localhost --silent" 2>/dev/null || \
+               docker exec ${CONTAINER_NAME} sh -c "/usr/bin/mysqladmin ping -h localhost --silent" 2>/dev/null; then
                 echo ""
                 print_info "MySQL 服务已就绪 (耗时: $((attempt * 2)) 秒)"
                 return 0
             fi
         fi
         
+        # 方法3: 检查端口
+        if docker exec ${CONTAINER_NAME} sh -c "netstat -tuln 2>/dev/null | grep ':3306' || ss -tuln 2>/dev/null | grep ':3306'" 2>/dev/null; then
+            mysql_running=true
+        fi
+        
         attempt=$((attempt + 1))
         echo -n "."
         sleep 2
         
-        # 每 10 次显示提示
-        if [ $((attempt % 10)) -eq 0 ]; then
+        # 每 15 次显示提示
+        if [ $((attempt % 15)) -eq 0 ]; then
             echo ""
             print_info "仍在等待 MySQL 启动... ($((attempt * 2))/$((max_attempts * 2)) 秒)"
             
-            # 20秒后尝试手动启动
-            if [ $attempt -eq 10 ]; then
+            # 30秒后尝试手动启动
+            if [ $attempt -eq 15 ]; then
                 echo ""
                 print_warn "MySQL 未自动启动，尝试手动启动..."
                 manual_start_mysql
                 echo -n "继续等待"
             fi
             
-            # 显示 MySQL 日志的最后几行
-            if [ $attempt -eq 20 ]; then
+            # 60秒后显示诊断信息
+            if [ $attempt -eq 30 ]; then
                 echo ""
-                print_warn "MySQL 启动时间较长，查看日志:"
-                docker exec ${CONTAINER_NAME} tail -10 /var/log/mysql/error.log 2>/dev/null || \
-                docker exec ${CONTAINER_NAME} find /var/lib/mysql -name "*.err" -exec tail -10 {} \; 2>/dev/null || \
-                echo "  无法读取 MySQL 日志"
+                print_warn "MySQL 启动时间较长，显示诊断信息:"
+                echo "进程列表:"
+                docker exec ${CONTAINER_NAME} ps aux | head -20
+                echo ""
+                echo "端口监听:"
+                docker exec ${CONTAINER_NAME} sh -c "netstat -tuln 2>/dev/null || ss -tuln 2>/dev/null" | grep -E "3306|mysql"
                 echo ""
                 echo -n "继续等待"
             fi
@@ -237,39 +297,18 @@ wait_for_mysql() {
     
     # 显示详细错误信息
     echo ""
-    print_warn "故障排除步骤:"
-    echo "1. 查看 MySQL 进程:"
-    echo "   docker exec ${CONTAINER_NAME} ps aux | grep mysql"
+    print_warn "故障排除信息:"
+    echo "1. 容器内进程:"
+    docker exec ${CONTAINER_NAME} ps aux | grep -E "mysql|maria" | grep -v grep
     echo ""
-    echo "2. 查看 MySQL 错误日志:"
-    echo "   docker exec ${CONTAINER_NAME} tail -50 /var/log/mysql/error.log"
-    echo "   或: find /opt/xboard-distro/mysql -name '*.err' -exec cat {} \\;"
+    echo "2. 查找 MySQL 相关文件:"
+    docker exec ${CONTAINER_NAME} sh -c "find /usr -name 'mysql*' -type f 2>/dev/null | head -10"
     echo ""
-    echo "3. 检查数据目录权限:"
-    echo "   ls -la /opt/xboard-distro/mysql"
-    echo ""
-    echo "4. 手动进入容器检查:"
-    echo "   docker exec -it ${CONTAINER_NAME} /bin/ash"
-    echo "   rc-service mysql start"
-    echo ""
-    echo "5. 如果数据损坏，重新初始化:"
-    echo "   rm -rf /opt/xboard-distro/mysql/*"
-    echo "   $0 deploy"
+    echo "3. 系统服务状态:"
+    docker exec ${CONTAINER_NAME} sh -c "rc-status 2>/dev/null || service --status-all 2>/dev/null || systemctl status 2>/dev/null | head -20"
     echo ""
     
     return 1
-}
-
-# 检查数据库表是否存在
-check_database_tables() {
-    # 检查关键表是否存在（users 表）
-    local table_count=$(docker exec ${CONTAINER_NAME} mysql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='xboard' AND table_name='users';" 2>/dev/null || echo "0")
-    
-    if [ "$table_count" -gt 0 ]; then
-        return 0  # 表存在
-    else
-        return 1  # 表不存在
-    fi
 }
 
 # 手动启动 MySQL
@@ -279,72 +318,126 @@ manual_start_mysql() {
     # 检查容器是否运行
     if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         print_error "容器未运行"
-        exit 1
+        return 1
     fi
+    
+    # 获取 MySQL 路径
+    local paths=$(get_mysql_paths)
+    eval "$paths"
     
     # 检查 MySQL 是否已在运行
-    if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-        print_info "MySQL 已在运行"
-        return 0
+    if docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -v grep | grep -E 'mysqld|mariadbd'" 2>/dev/null; then
+        print_info "MySQL 进程已存在"
+        # 尝试连接测试
+        if [ -n "$MYSQLADMIN_PATH" ]; then
+            if docker exec ${CONTAINER_NAME} sh -c "${MYSQLADMIN_PATH} ping -h localhost --silent" 2>/dev/null; then
+                print_info "MySQL 已在运行且可连接"
+                return 0
+            fi
+        fi
     fi
     
-    print_info "方法1: 使用 rc-service (Alpine/OpenRC)..."
-    if docker exec ${CONTAINER_NAME} rc-service mysql start 2>/dev/null || \
-       docker exec ${CONTAINER_NAME} rc-service mysqld start 2>/dev/null || \
-       docker exec ${CONTAINER_NAME} rc-service mariadb start 2>/dev/null; then
+    # 确保数据目录权限正确
+    print_info "设置数据目录权限..."
+    docker exec ${CONTAINER_NAME} sh -c "
+        mkdir -p /var/lib/mysql /var/run/mysqld /var/log/mysql
+        chown -R mysql:mysql /var/lib/mysql /var/run/mysqld /var/log/mysql 2>/dev/null || \
+        chown -R mysql:mysql /var/lib/mysql /run/mysqld /var/log/mysql 2>/dev/null
+        chmod 755 /var/run/mysqld 2>/dev/null || chmod 755 /run/mysqld 2>/dev/null
+    " 2>/dev/null
+    
+    # 尝试不同的启动方法
+    print_info "方法1: 使用系统服务管理器..."
+    
+    # OpenRC (Alpine)
+    if docker exec ${CONTAINER_NAME} sh -c "which rc-service" 2>/dev/null; then
+        docker exec ${CONTAINER_NAME} sh -c "rc-service mysql start || rc-service mysqld start || rc-service mariadb start" 2>/dev/null
         sleep 5
-        if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-            print_info "MySQL 启动成功"
+        if docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -v grep | grep -E 'mysqld|mariadbd'" 2>/dev/null; then
+            print_info "MySQL 通过 OpenRC 启动成功"
+            return 0
+        fi
+    fi
+    
+    # service 命令
+    if docker exec ${CONTAINER_NAME} sh -c "which service" 2>/dev/null; then
+        docker exec ${CONTAINER_NAME} sh -c "service mysql start || service mysqld start || service mariadb start" 2>/dev/null
+        sleep 5
+        if docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -v grep | grep -E 'mysqld|mariadbd'" 2>/dev/null; then
+            print_info "MySQL 通过 service 启动成功"
+            return 0
+        fi
+    fi
+    
+    # systemctl
+    if docker exec ${CONTAINER_NAME} sh -c "which systemctl" 2>/dev/null; then
+        docker exec ${CONTAINER_NAME} sh -c "systemctl start mysql || systemctl start mysqld || systemctl start mariadb" 2>/dev/null
+        sleep 5
+        if docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -v grep | grep -E 'mysqld|mariadbd'" 2>/dev/null; then
+            print_info "MySQL 通过 systemctl 启动成功"
             return 0
         fi
     fi
     
     print_info "方法2: 直接启动 mysqld 进程..."
-    # 确保数据目录存在且权限正确
-    docker exec ${CONTAINER_NAME} sh -c "
-        mkdir -p /var/lib/mysql /var/run/mysqld
-        chown -R mysql:mysql /var/lib/mysql /var/run/mysqld
-        chmod 755 /var/run/mysqld
-    " 2>/dev/null
     
-    # 尝试不同的启动命令
-    docker exec -d ${CONTAINER_NAME} mysqld --user=mysql --datadir=/var/lib/mysql --skip-networking=0 2>/dev/null || \
-    docker exec -d ${CONTAINER_NAME} /usr/bin/mysqld --user=mysql 2>/dev/null || \
-    docker exec -d ${CONTAINER_NAME} /usr/sbin/mysqld --user=mysql 2>/dev/null || \
-    docker exec -d ${CONTAINER_NAME} mysqld_safe --user=mysql 2>/dev/null
-    
-    sleep 8
-    
-    if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-        print_info "MySQL 启动成功"
-        return 0
-    fi
-    
-    print_info "方法3: 检查是否需要初始化数据库..."
-    # 检查数据库是否需要初始化
-    if [ ! -d "${DATA_ROOT}/mysql/mysql" ]; then
-        print_warn "MySQL 数据目录未初始化，尝试初始化..."
-        docker exec ${CONTAINER_NAME} mysql_install_db --user=mysql --datadir=/var/lib/mysql 2>/dev/null || \
-        docker exec ${CONTAINER_NAME} mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql 2>/dev/null
+    if [ -n "$MYSQLD_PATH" ]; then
+        # 检查是否需要初始化
+        if [ ! -d "${DATA_ROOT}/mysql/mysql" ]; then
+            print_warn "数据库未初始化，执行初始化..."
+            # 尝试初始化
+            docker exec ${CONTAINER_NAME} sh -c "
+                if [ -x /usr/bin/mysql_install_db ]; then
+                    /usr/bin/mysql_install_db --user=mysql --datadir=/var/lib/mysql
+                elif [ -x ${MYSQLD_PATH} ]; then
+                    ${MYSQLD_PATH} --initialize-insecure --user=mysql --datadir=/var/lib/mysql
+                fi
+            " 2>/dev/null
+            sleep 3
+        fi
         
-        sleep 3
-        
-        # 重新启动
-        docker exec -d ${CONTAINER_NAME} mysqld --user=mysql --datadir=/var/lib/mysql 2>/dev/null
+        # 启动 mysqld
+        docker exec -d ${CONTAINER_NAME} sh -c "${MYSQLD_PATH} --user=mysql --datadir=/var/lib/mysql --skip-networking=0" 2>/dev/null
         sleep 8
         
-        if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-            print_info "MySQL 初始化并启动成功"
+        if docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -v grep | grep -E 'mysqld|mariadbd'" 2>/dev/null; then
+            print_info "MySQL 直接启动成功"
+            return 0
+        fi
+    fi
+    
+    # 尝试使用 mysqld_safe
+    if docker exec ${CONTAINER_NAME} sh -c "which mysqld_safe" 2>/dev/null; then
+        print_info "方法3: 使用 mysqld_safe..."
+        docker exec -d ${CONTAINER_NAME} sh -c "mysqld_safe --user=mysql --datadir=/var/lib/mysql" 2>/dev/null
+        sleep 8
+        
+        if docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -v grep | grep -E 'mysqld|mariadbd'" 2>/dev/null; then
+            print_info "MySQL 通过 mysqld_safe 启动成功"
             return 0
         fi
     fi
     
     print_error "MySQL 手动启动失败"
-    print_warn "详细错误信息:"
-    docker exec ${CONTAINER_NAME} tail -20 /var/log/mysql/error.log 2>/dev/null || \
-    docker exec ${CONTAINER_NAME} cat /var/lib/mysql/*.err 2>/dev/null || \
-    echo "无法读取 MySQL 日志"
     return 1
+}
+
+# 检查数据库表是否存在
+check_database_tables() {
+    # 获取 MySQL 路径
+    local paths=$(get_mysql_paths)
+    eval "$paths"
+    
+    local mysql_cmd="${MYSQL_PATH:-mysql}"
+    
+    # 检查关键表是否存在（users 表）
+    local table_count=$(docker exec ${CONTAINER_NAME} sh -c "${mysql_cmd} -N -e \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='xboard' AND table_name='users';\"" 2>/dev/null || echo "0")
+    
+    if [ "$table_count" = "1" ] || [ "$table_count" -gt 0 ]; then
+        return 0  # 表存在
+    else
+        return 1  # 表不存在
+    fi
 }
 
 # 初始化服务（仅首次）
@@ -353,23 +446,16 @@ init_service() {
     
     # 等待 MySQL 启动
     if ! wait_for_mysql; then
-        print_warn "MySQL 自动启动失败，尝试手动启动..."
-        if ! manual_start_mysql; then
-            print_error "MySQL 启动完全失败，无法继续"
-            echo ""
-            print_warn "故障排除步骤:"
-            echo "1. 查看容器状态: docker ps -a"
-            echo "2. 查看容器日志: docker logs ${CONTAINER_NAME}"
-            echo "3. 进入容器检查: docker exec -it ${CONTAINER_NAME} /bin/ash"
-            echo "4. 检查数据目录权限: ls -la ${DATA_ROOT}/mysql"
-            echo "5. 尝试删除数据重新初始化:"
-            echo "   rm -rf ${DATA_ROOT}/mysql/*"
-            echo "   $0 deploy"
-            exit 1
-        fi
+        print_error "MySQL 启动失败，无法继续初始化"
+        print_warn "请尝试以下操作："
+        echo "1. 检查镜像是否正确: docker images | grep xboard"
+        echo "2. 重新拉取或构建镜像"
+        echo "3. 检查容器日志: docker logs ${CONTAINER_NAME}"
+        echo "4. 手动进入容器排查: docker exec -it ${CONTAINER_NAME} /bin/sh"
+        exit 1
     fi
     
-    # 检查数据库是否已初始化（检查数据库表，不仅仅是文件）
+    # 检查数据库是否已初始化
     if check_database_initialized && check_database_tables; then
         print_warn "=========================================="
         print_warn "检测到已存在的数据库和表结构"
@@ -379,14 +465,20 @@ init_service() {
         
         # 只启动服务，绝不执行 init
         print_step "启动 XBoard 服务（使用现有数据）..."
-        docker exec ${CONTAINER_NAME} php service start
+        docker exec ${CONTAINER_NAME} sh -c "cd /www/xboard && php service start" 2>/dev/null || \
+        docker exec ${CONTAINER_NAME} sh -c "php /www/xboard/service start" 2>/dev/null || \
+        docker exec ${CONTAINER_NAME} php service start 2>/dev/null
         
         if [ -f "${init_flag}" ]; then
-            print_info "数据库初始化时间: $(grep '初始化时间' ${init_flag})"
+            print_info "数据库初始化信息:"
+            cat ${init_flag}
         fi
         
         # 验证数据库中的用户数
-        local user_count=$(docker exec ${CONTAINER_NAME} mysql -N -e "SELECT COUNT(*) FROM xboard.users;" 2>/dev/null || echo "0")
+        local paths=$(get_mysql_paths)
+        eval "$paths"
+        local mysql_cmd="${MYSQL_PATH:-mysql}"
+        local user_count=$(docker exec ${CONTAINER_NAME} sh -c "${mysql_cmd} -N -e \"SELECT COUNT(*) FROM xboard.users;\"" 2>/dev/null || echo "0")
         print_info "数据库中现有用户数: ${user_count}"
         
         return 0
@@ -400,9 +492,14 @@ init_service() {
     echo "=========================================="
     sleep 2
     
-    # 注意：php service init 会初始化数据库和创建管理员
-    # 这个命令只在首次部署时执行
-    docker exec -it ${CONTAINER_NAME} php service init
+    # 尝试不同的初始化命令
+    if docker exec ${CONTAINER_NAME} sh -c "test -f /www/xboard/service" 2>/dev/null; then
+        docker exec -it ${CONTAINER_NAME} sh -c "cd /www/xboard && php service init"
+    elif docker exec ${CONTAINER_NAME} sh -c "test -f /www/xboard/artisan" 2>/dev/null; then
+        docker exec -it ${CONTAINER_NAME} sh -c "cd /www/xboard && php artisan xboard:install"
+    else
+        docker exec -it ${CONTAINER_NAME} php service init
+    fi
     
     # 创建初始化标记
     touch ${init_flag}
@@ -415,124 +512,6 @@ init_service() {
     echo ""
     print_info "初始化完成！重要信息已显示，请妥善保存！"
     echo ""
-}
-
-# 重置管理员密码（不影响用户数据）
-reset_admin() {
-    print_warn "=========================================="
-    print_warn "重置管理员账号"
-    print_warn "=========================================="
-    print_warn "此操作将重置管理员密码和后台路径"
-    print_warn "但不会影响用户数据、订阅、节点等信息"
-    echo ""
-    read -p "确认重置管理员? (输入 yes 继续): " confirm
-    
-    if [ "$confirm" != "yes" ]; then
-        print_info "取消重置操作"
-        return 0
-    fi
-    
-    print_step "执行管理员重置..."
-    
-    # 使用专门的管理员重置命令（如果存在）
-    # 如果没有专门的命令，需要手动操作数据库
-    if docker exec ${CONTAINER_NAME} php service --help 2>/dev/null | grep -q "reset-admin"; then
-        docker exec -it ${CONTAINER_NAME} php service reset-admin
-    else
-        print_warn "未找到 reset-admin 命令"
-        print_info "请使用以下方法手动重置："
-        echo ""
-        echo "方法1: 进入容器手动重置"
-        echo "  docker exec -it ${CONTAINER_NAME} /bin/ash"
-        echo "  cd /www/xboard"
-        echo "  php artisan admin:reset"
-        echo ""
-        echo "方法2: 直接操作数据库"
-        echo "  docker exec -it ${CONTAINER_NAME} mysql xboard"
-        echo "  UPDATE users SET password=MD5('新密码') WHERE id=1;"
-        echo ""
-    fi
-}
-
-# 配置 OAuth2
-configure_oauth2() {
-    local oauth_config="${DATA_ROOT}/oauth2/func.php"
-    
-    print_step "配置 OAuth2 参数..."
-    
-    # 等待文件生成
-    sleep 2
-    
-    if [ ! -f "${oauth_config}" ]; then
-        print_warn "OAuth2 配置文件不存在，稍后可手动配置"
-        print_info "配置文件路径: ${oauth_config}"
-        return 0
-    fi
-    
-    # 检查是否已配置
-    if grep -q "CLIENT_ID = '[^']'" ${oauth_config} 2>/dev/null; then
-        print_info "OAuth2 已配置，跳过"
-        return 0
-    fi
-    
-    echo ""
-    echo "请输入 OAuth2 配置信息（直接回车跳过）："
-    read -p "Client ID: " client_id
-    read -p "Client Secret: " client_secret
-    
-    if [ -n "$client_id" ] && [ -n "$client_secret" ]; then
-        docker exec ${CONTAINER_NAME} sed -i \
-            "s/\$CLIENT_ID = '.*'/\$CLIENT_ID = '${client_id}'/" \
-            /home/oauth2/func.php
-        
-        docker exec ${CONTAINER_NAME} sed -i \
-            "s/\$CLIENT_SECRET = '.*'/\$CLIENT_SECRET = '${client_secret}'/" \
-            /home/oauth2/func.php
-        
-        print_info "OAuth2 配置更新成功"
-    else
-        print_warn "跳过 OAuth2 配置，稍后可手动配置"
-        print_info "配置方法: docker exec -it ${CONTAINER_NAME} vi /home/oauth2/func.php"
-    fi
-}
-
-# 启动服务（非首次部署时使用）
-start_services() {
-    print_step "检查数据库状态并启动服务..."
-    
-    # 等待 MySQL 启动
-    wait_for_mysql || exit 1
-    
-    # 检查是否有现有数据
-    if check_database_tables; then
-        local user_count=$(docker exec ${CONTAINER_NAME} mysql -N -e "SELECT COUNT(*) FROM xboard.users;" 2>/dev/null || echo "0")
-        print_info "检测到现有数据库，用户数: ${user_count}"
-        print_info "直接启动服务，不执行初始化"
-    else
-        print_warn "警告: 数据库表不存在！"
-        print_warn "如果这不是首次部署，数据可能已损坏"
-        print_warn "建议使用备份恢复: $0 restore <备份文件>"
-    fi
-    
-    docker exec ${CONTAINER_NAME} php service start
-    
-    print_info "等待服务完全启动..."
-    sleep 5
-    
-    # 验证服务状态
-    if docker exec ${CONTAINER_NAME} ps aux | grep -v grep | grep -q caddy; then
-        print_info "✓ Caddy 服务运行正常"
-    else
-        print_warn "✗ Caddy 服务可能未启动"
-    fi
-    
-    if docker exec ${CONTAINER_NAME} ps aux | grep -v grep | grep -q mysqld; then
-        print_info "✓ MySQL 服务运行正常"
-    else
-        print_warn "✗ MySQL 服务可能未启动"
-    fi
-    
-    print_info "服务启动完成！"
 }
 
 # 显示访问信息
@@ -556,37 +535,235 @@ show_access_info() {
     echo ""
     echo -e "${BLUE}数据持久化:${NC}"
     echo "  根目录: ${DATA_ROOT}"
-    echo "  MySQL:  ${DATA_ROOT}/mysql     (数据库文件)"
-    echo "  XBoard: ${DATA_ROOT}/xboard    (网站文件)"
-    echo "  XrayR:  ${DATA_ROOT}/xrayr     (节点配置)"
-    echo "  OAuth2: ${DATA_ROOT}/oauth2    (OAuth配置)"
-    echo "  Caddy:  ${DATA_ROOT}/caddy     (Web服务器配置)"
-    echo "  Certs:  ${DATA_ROOT}/certs     (SSL证书)"
-    echo "  Logs:   ${DATA_ROOT}/logs      (日志文件)"
+    echo "  MySQL:  ${DATA_ROOT}/mysql"
+    echo "  XBoard: ${DATA_ROOT}/xboard"
     echo ""
     echo -e "${BLUE}管理命令:${NC}"
     echo "  查看状态: $0 status"
-    echo "  进入容器: docker exec -it ${CONTAINER_NAME} /bin/ash"
+    echo "  诊断问题: $0 diagnose"
+    echo "  进入容器: docker exec -it ${CONTAINER_NAME} /bin/sh"
     echo "  查看日志: docker logs -f ${CONTAINER_NAME}"
     echo "  重启容器: docker restart ${CONTAINER_NAME}"
-    echo "  停止容器: docker stop ${CONTAINER_NAME}"
-    echo "  启动服务: docker exec ${CONTAINER_NAME} php service start"
-    echo "  停止服务: docker exec ${CONTAINER_NAME} php service stop"
-    echo "  重置管理员: $0 reset-admin"
-    echo ""
-    echo -e "${BLUE}备份与恢复:${NC}"
-    echo "  备份数据: $0 backup"
-    echo "  恢复数据: $0 restore <备份文件>"
     echo ""
     echo -e "${YELLOW}重要提示:${NC}"
     echo "  1. 所有数据已持久化到 ${DATA_ROOT}"
-    echo "  2. 删除容器不会丢失任何用户数据"
-    echo "  3. 重新部署使用: $0 redeploy (保留所有数据)"
-    echo "  4. 仅重置管理员: $0 reset-admin (不影响用户)"
-    echo "  5. 定期备份数据: $0 backup"
-    echo "  6. 后台路径请查看首次初始化时的输出"
+    echo "  2. 首次访问可能需要等待服务完全启动"
+    echo "  3. 如遇到问题，使用 $0 diagnose 诊断"
     echo "=========================================="
     echo ""
+}
+
+# 诊断功能
+diagnose() {
+    print_step "诊断 XBoard-Distro 系统..."
+    echo ""
+    
+    # 检查容器
+    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        print_info "✓ 容器运行中"
+    else
+        print_error "✗ 容器未运行"
+        exit 1
+    fi
+    
+    # 获取 MySQL 路径
+    print_step "查找系统组件..."
+    local paths=$(get_mysql_paths)
+    eval "$paths"
+    echo "  mysqld: ${MYSQLD_PATH:-未找到}"
+    echo "  mysql: ${MYSQL_PATH:-未找到}"
+    echo "  mysqladmin: ${MYSQLADMIN_PATH:-未找到}"
+    
+    # 检查进程
+    echo ""
+    print_step "检查关键进程..."
+    echo "MySQL 进程:"
+    docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -E 'mysql|maria' | grep -v grep" || echo "  未找到 MySQL 进程"
+    
+    echo ""
+    echo "其他服务进程:"
+    docker exec ${CONTAINER_NAME} sh -c "ps aux | grep -E 'caddy|php|xray' | grep -v grep" || echo "  未找到其他服务"
+    
+    # 检查端口
+    echo ""
+    print_step "检查端口监听..."
+    docker exec ${CONTAINER_NAME} sh -c "netstat -tuln 2>/dev/null || ss -tuln 2>/dev/null" | grep -E "3306|16443|443|4443" || echo "  无端口监听"
+    
+    # 检查文件系统
+    echo ""
+    print_step "检查文件系统..."
+    echo "XBoard 目录:"
+    docker exec ${CONTAINER_NAME} sh -c "ls -la /www/xboard 2>/dev/null | head -5" || echo "  目录不存在"
+    
+    echo ""
+    echo "MySQL 数据目录:"
+    docker exec ${CONTAINER_NAME} sh -c "ls -la /var/lib/mysql 2>/dev/null | head -5" || echo "  目录不存在"
+    
+    # 检查系统服务
+    echo ""
+    print_step "检查系统服务管理器..."
+    if docker exec ${CONTAINER_NAME} sh -c "which rc-service" 2>/dev/null; then
+        echo "OpenRC 已安装"
+        docker exec ${CONTAINER_NAME} sh -c "rc-status" 2>/dev/null || echo "  rc-status 不可用"
+    elif docker exec ${CONTAINER_NAME} sh -c "which systemctl" 2>/dev/null; then
+        echo "Systemd 已安装"
+        docker exec ${CONTAINER_NAME} sh -c "systemctl status mysql 2>/dev/null | head -10" || echo "  systemctl 不可用"
+    elif docker exec ${CONTAINER_NAME} sh -c "which service" 2>/dev/null; then
+        echo "SysV init 已安装"
+        docker exec ${CONTAINER_NAME} sh -c "service --status-all 2>/dev/null" || echo "  service 不可用"
+    else
+        echo "未检测到服务管理器"
+    fi
+    
+    # 检查 PHP
+    echo ""
+    print_step "检查 PHP 环境..."
+    docker exec ${CONTAINER_NAME} sh -c "php -v 2>/dev/null | head -1" || echo "  PHP 未安装或不可用"
+    docker exec ${CONTAINER_NAME} sh -c "which php" 2>/dev/null || echo "  找不到 php 命令"
+    
+    echo ""
+    print_info "诊断完成"
+}
+
+# 显示状态
+show_status() {
+    echo "=========================================="
+    echo "XBoard-Distro 运行状态"
+    echo "=========================================="
+    echo ""
+    
+    # 容器状态
+    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo -e "${GREEN}✓ 容器状态: 运行中${NC}"
+        docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+        
+        echo ""
+        echo "服务状态:"
+        docker exec ${CONTAINER_NAME} ps aux | grep -E "caddy|mysqld|mariadbd|XrayR|php" | grep -v grep || echo "  无法获取服务状态"
+        
+        # 数据库连接测试
+        echo ""
+        local paths=$(get_mysql_paths)
+        eval "$paths"
+        local mysqladmin_cmd="${MYSQLADMIN_PATH:-mysqladmin}"
+        
+        if docker exec ${CONTAINER_NAME} sh -c "${mysqladmin_cmd} ping -h localhost --silent" 2>/dev/null; then
+            echo -e "${GREEN}✓ MySQL 连接: 正常${NC}"
+            
+            # 显示数据库信息
+            local mysql_cmd="${MYSQL_PATH:-mysql}"
+            local user_count=$(docker exec ${CONTAINER_NAME} sh -c "${mysql_cmd} -N -e \"SELECT COUNT(*) FROM xboard.users WHERE id > 0;\"" 2>/dev/null || echo "0")
+            local admin_count=$(docker exec ${CONTAINER_NAME} sh -c "${mysql_cmd} -N -e \"SELECT COUNT(*) FROM xboard.users WHERE is_admin = 1;\"" 2>/dev/null || echo "0")
+            local order_count=$(docker exec ${CONTAINER_NAME} sh -c "${mysql_cmd} -N -e \"SELECT COUNT(*) FROM xboard.orders;\"" 2>/dev/null || echo "0")
+            
+            echo "  总用户数: ${user_count}"
+            echo "  管理员数: ${admin_count}"
+            echo "  订单数: ${order_count}"
+        else
+            echo -e "${RED}✗ MySQL 连接: 失败${NC}"
+            echo "  尝试手动启动: $0 fix-mysql"
+        fi
+    else
+        echo -e "${RED}✗ 容器状态: 未运行${NC}"
+        if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "  容器已停止，使用 '$0 start' 启动"
+        else
+            echo "  容器不存在，使用 '$0 deploy' 部署"
+        fi
+    fi
+    
+    echo ""
+    echo "=========================================="
+    echo "数据持久化状态"
+    echo "=========================================="
+    
+    if [ -d "${DATA_ROOT}" ]; then
+        echo "数据根目录: ${DATA_ROOT}"
+        echo ""
+        du -sh ${DATA_ROOT}/* 2>/dev/null | while read size path; do
+            local name=$(basename $path)
+            printf "  %-10s %s\n" "$name:" "$size"
+        done
+        
+        # 检查初始化标记
+        echo ""
+        if [ -f "${DATA_ROOT}/.initialized" ]; then
+            echo "初始化信息:"
+            cat ${DATA_ROOT}/.initialized | sed 's/^/  /'
+        fi
+    else
+        echo -e "${RED}✗ 数据目录不存在${NC}"
+    fi
+    
+    echo ""
+    echo "=========================================="
+}
+
+# 修复 MySQL
+fix_mysql() {
+    print_step "修复 MySQL 启动问题..."
+    echo ""
+    
+    if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        print_error "容器未运行，请先启动容器: $0 start"
+        exit 1
+    fi
+    
+    # 获取路径
+    local paths=$(get_mysql_paths)
+    eval "$paths"
+    
+    # 停止现有进程
+    print_info "停止现有 MySQL 进程..."
+    docker exec ${CONTAINER_NAME} sh -c "pkill -9 mysqld 2>/dev/null; pkill -9 mariadbd 2>/dev/null" || true
+    sleep 2
+    
+    # 修复权限
+    print_info "修复文件权限..."
+    docker exec ${CONTAINER_NAME} sh -c "
+        mkdir -p /var/lib/mysql /var/run/mysqld /run/mysqld /var/log/mysql
+        chown -R mysql:mysql /var/lib/mysql
+        chown -R mysql:mysql /var/run/mysqld 2>/dev/null || chown -R mysql:mysql /run/mysqld 2>/dev/null
+        chown -R mysql:mysql /var/log/mysql
+        chmod 755 /var/run/mysqld 2>/dev/null || chmod 755 /run/mysqld 2>/dev/null
+        chmod 750 /var/lib/mysql
+    "
+    
+    # 检查是否需要初始化
+    if [ ! -d "${DATA_ROOT}/mysql/mysql" ]; then
+        print_warn "数据库未初始化，执行初始化..."
+        if [ -n "$MYSQLD_PATH" ]; then
+            docker exec ${CONTAINER_NAME} sh -c "${MYSQLD_PATH} --initialize-insecure --user=mysql --datadir=/var/lib/mysql" 2>/dev/null
+        else
+            docker exec ${CONTAINER_NAME} sh -c "
+                mysql_install_db --user=mysql --datadir=/var/lib/mysql 2>/dev/null || \
+                mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql 2>/dev/null
+            "
+        fi
+        sleep 3
+    fi
+    
+    # 尝试启动
+    print_info "启动 MySQL..."
+    manual_start_mysql
+    
+    # 验证
+    sleep 5
+    if docker exec ${CONTAINER_NAME} sh -c "${MYSQLADMIN_PATH:-mysqladmin} ping -h localhost --silent" 2>/dev/null; then
+        print_info "✓ MySQL 修复成功！"
+        
+        # 启动 XBoard 服务
+        print_info "启动 XBoard 服务..."
+        docker exec ${CONTAINER_NAME} sh -c "cd /www/xboard && php service start" 2>/dev/null || \
+        docker exec ${CONTAINER_NAME} php service start 2>/dev/null
+    else
+        print_error "✗ MySQL 修复失败"
+        echo ""
+        echo "请尝试以下操作："
+        echo "1. 查看容器日志: docker logs ${CONTAINER_NAME}"
+        echo "2. 进入容器手动检查: docker exec -it ${CONTAINER_NAME} /bin/sh"
+        echo "3. 重新部署: $0 redeploy"
+    fi
 }
 
 # 备份数据
@@ -649,7 +826,6 @@ restore_data() {
     print_warn "数据恢复操作"
     print_warn "=========================================="
     print_warn "即将恢复数据，这将覆盖现有所有数据！"
-    print_warn "包括：用户数据、订阅、节点配置等"
     echo ""
     read -p "确认继续? (输入 YES 继续): " confirm
     
@@ -665,134 +841,11 @@ restore_data() {
     tar -xzf ${backup_file} -C ${DATA_ROOT}
     
     print_info "数据恢复完成，正在启动容器..."
-}
-
-# 显示状态
-show_status() {
-    echo "=========================================="
-    echo "XBoard-Distro 运行状态"
-    echo "=========================================="
-    echo ""
+    start_container
+    wait_for_mysql
     
-    # 容器状态
-    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo -e "${GREEN}✓ 容器状态: 运行中${NC}"
-        docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-        
-        echo ""
-        echo "服务状态:"
-        docker exec ${CONTAINER_NAME} ps aux | grep -E "caddy|mysqld|XrayR" | grep -v grep || echo "  无法获取服务状态"
-        
-        # 数据库连接测试
-        echo ""
-        if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-            echo -e "${GREEN}✓ MySQL 连接: 正常${NC}"
-            
-            # 显示数据库信息
-            local user_count=$(docker exec ${CONTAINER_NAME} mysql -N -e "SELECT COUNT(*) FROM xboard.users WHERE id > 0;" 2>/dev/null || echo "0")
-            local admin_count=$(docker exec ${CONTAINER_NAME} mysql -N -e "SELECT COUNT(*) FROM xboard.users WHERE is_admin = 1;" 2>/dev/null || echo "0")
-            local order_count=$(docker exec ${CONTAINER_NAME} mysql -N -e "SELECT COUNT(*) FROM xboard.orders;" 2>/dev/null || echo "0")
-            
-            echo "  总用户数: ${user_count}"
-            echo "  管理员数: ${admin_count}"
-            echo "  订单数: ${order_count}"
-        else
-            echo -e "${RED}✗ MySQL 连接: 失败${NC}"
-        fi
-    else
-        echo -e "${RED}✗ 容器状态: 未运行${NC}"
-        if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "  容器已停止，使用 '$0 start' 启动"
-        else
-            echo "  容器不存在，使用 '$0 deploy' 部署"
-        fi
-    fi
-    
-    echo ""
-    echo "=========================================="
-    echo "数据持久化状态"
-    echo "=========================================="
-    
-    if [ -d "${DATA_ROOT}" ]; then
-        echo "数据根目录: ${DATA_ROOT}"
-        echo ""
-        du -sh ${DATA_ROOT}/* 2>/dev/null | while read size path; do
-            local name=$(basename $path)
-            printf "  %-10s %s\n" "$name:" "$size"
-        done
-        
-        # 检查数据库文件
-        echo ""
-        if [ -d "${DATA_ROOT}/mysql/xboard" ]; then
-            echo -e "${GREEN}✓ 数据库文件: 存在${NC}"
-            local db_size=$(du -sh ${DATA_ROOT}/mysql 2>/dev/null | cut -f1)
-            echo "  数据库大小: ${db_size}"
-            
-            # 列出数据库文件
-            local table_count=$(find ${DATA_ROOT}/mysql/xboard -name "*.ibd" 2>/dev/null | wc -l)
-            echo "  表文件数: ${table_count}"
-        else
-            echo -e "${YELLOW}✗ 数据库文件: 不存在${NC}"
-        fi
-        
-        # 检查初始化标记
-        echo ""
-        if [ -f "${DATA_ROOT}/.initialized" ]; then
-            echo "初始化信息:"
-            cat ${DATA_ROOT}/.initialized | sed 's/^/  /'
-        fi
-    else
-        echo -e "${RED}✗ 数据目录不存在${NC}"
-    fi
-    
-    echo ""
-    echo "=========================================="
-}
-
-# 验证数据完整性
-verify_data() {
-    print_step "验证数据完整性..."
-    echo ""
-    
-    # 检查容器
-    if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        print_error "容器未运行，无法验证数据"
-        exit 1
-    fi
-    
-    # 检查数据库连接
-    if ! docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-        print_error "MySQL 未运行或无法连接"
-        exit 1
-    fi
-    
-    print_info "数据库连接正常"
-    
-    # 检查关键表
-    local tables=("users" "orders" "plans" "servers" "nodes")
-    echo ""
-    echo "检查数据库表:"
-    
-    for table in "${tables[@]}"; do
-        local exists=$(docker exec ${CONTAINER_NAME} mysql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='xboard' AND table_name='${table}';" 2>/dev/null || echo "0")
-        
-        if [ "$exists" = "1" ]; then
-            local count=$(docker exec ${CONTAINER_NAME} mysql -N -e "SELECT COUNT(*) FROM xboard.${table};" 2>/dev/null || echo "0")
-            echo -e "  ${GREEN}✓${NC} ${table}: ${count} 条记录"
-        else
-            echo -e "  ${RED}✗${NC} ${table}: 表不存在"
-        fi
-    done
-    
-    # 检查管理员
-    echo ""
-    echo "管理员账号:"
-    docker exec ${CONTAINER_NAME} mysql -N -e "SELECT id, email, is_admin FROM xboard.users WHERE is_admin = 1 LIMIT 5;" 2>/dev/null | while read id email is_admin; do
-        echo "  ID: ${id}, Email: ${email}"
-    done
-    
-    echo ""
-    print_info "数据验证完成"
+    print_info "恢复完成！"
+    show_access_info
 }
 
 # 主函数
@@ -809,8 +862,7 @@ main() {
             setup_firewall
             remove_old_container
             start_container
-            init_service  # 会自动判断是否首次部署
-            configure_oauth2
+            init_service
             show_access_info
             ;;
         redeploy)
@@ -818,7 +870,6 @@ main() {
             echo "XBoard-Distro 重新部署"
             echo "=========================================="
             print_warn "注意: 此操作会删除容器但保留所有数据"
-            print_info "如果数据库已存在，将跳过初始化"
             echo ""
             read -p "确认继续? (回车继续，Ctrl+C 取消): " confirm
             check_root
@@ -826,136 +877,32 @@ main() {
             check_ports
             remove_old_container
             start_container
-            # 智能判断是否需要初始化
             init_service
             show_access_info
-            ;;
-        reset-admin)
-            check_root
-            if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-                print_error "容器未运行，请先启动容器"
-                exit 1
-            fi
-            reset_admin
             ;;
         backup)
             backup_data
             ;;
         restore)
             restore_data "$2"
-            start_container
-            start_services
-            show_access_info
             ;;
         status)
             show_status
             ;;
-        verify)
-            verify_data
-            ;;
         diagnose)
-            print_step "诊断 XBoard-Distro..."
-            echo ""
-            
-            # 检查容器
-            if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-                print_info "✓ 容器运行中"
-            else
-                print_error "✗ 容器未运行"
-                exit 1
-            fi
-            
-            # 检查 MySQL 进程
-            echo ""
-            print_step "检查 MySQL 进程..."
-            docker exec ${CONTAINER_NAME} ps aux | grep -E "[m]ysql" || echo "未找到 MySQL 进程"
-            
-            # 检查 MySQL 连接
-            echo ""
-            print_step "测试 MySQL 连接..."
-            if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-                print_info "✓ MySQL 连接正常"
-            else
-                print_error "✗ MySQL 连接失败"
-                
-                print_step "尝试手动启动 MySQL..."
-                manual_start_mysql
-            fi
-            
-            # 检查数据目录
-            echo ""
-            print_step "检查数据目录..."
-            echo "MySQL 数据目录:"
-            docker exec ${CONTAINER_NAME} ls -lh /var/lib/mysql 2>/dev/null || echo "无法访问"
-            
-            # 检查日志
-            echo ""
-            print_step "最近的 MySQL 日志:"
-            docker exec ${CONTAINER_NAME} tail -20 /var/log/mysql/error.log 2>/dev/null || \
-            docker exec ${CONTAINER_NAME} find /var/lib/mysql -name "*.err" -exec tail -20 {} \; 2>/dev/null || \
-            echo "无法读取 MySQL 日志"
-            
-            # 检查端口
-            echo ""
-            print_step "检查端口监听..."
-            docker exec ${CONTAINER_NAME} netstat -tuln 2>/dev/null | grep -E "3306|16443|443|4443" || \
-            docker exec ${CONTAINER_NAME} ss -tuln 2>/dev/null | grep -E "3306|16443|443|4443" || \
-            echo "无法获取端口信息"
-            
-            # 检查服务
-            echo ""
-            print_step "检查所有服务..."
-            docker exec ${CONTAINER_NAME} ps aux | head -20
-            
-            # 检查 OpenRC 服务状态
-            echo ""
-            print_step "检查 OpenRC 服务状态..."
-            docker exec ${CONTAINER_NAME} rc-status 2>/dev/null || echo "rc-status 不可用"
-            
+            diagnose
             ;;
         fix-mysql)
-            print_step "修复 MySQL 启动问题..."
-            echo ""
-            
-            if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-                print_error "容器未运行"
-                exit 1
-            fi
-            
-            # 停止现有 MySQL 进程
-            print_info "停止现有 MySQL 进程..."
-            docker exec ${CONTAINER_NAME} pkill -9 mysqld 2>/dev/null || true
-            sleep 2
-            
-            # 检查并修复权限
-            print_info "检查并修复数据目录权限..."
-            docker exec ${CONTAINER_NAME} sh -c "
-                mkdir -p /var/lib/mysql /var/run/mysqld /var/log/mysql
-                chown -R mysql:mysql /var/lib/mysql /var/run/mysqld /var/log/mysql
-                chmod 755 /var/run/mysqld
-                chmod 750 /var/lib/mysql
-            "
-            
-            # 检查是否需要初始化
-            if [ ! -f "${DATA_ROOT}/mysql/mysql/user.frm" ] && [ ! -d "${DATA_ROOT}/mysql/mysql" ]; then
-                print_warn "MySQL 数据库未初始化，执行初始化..."
-                docker exec ${CONTAINER_NAME} mysql_install_db --user=mysql --datadir=/var/lib/mysql --force 2>/dev/null || \
-                docker exec ${CONTAINER_NAME} mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql 2>/dev/null
-            fi
-            
-            # 启动 MySQL
-            print_info "启动 MySQL..."
-            manual_start_mysql
-            
-            if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-                print_info "✓ MySQL 修复成功！"
-            else
-                print_error "✗ MySQL 修复失败"
-                echo ""
-                print_warn "请查看错误日志:"
-                docker exec ${CONTAINER_NAME} tail -30 /var/log/mysql/error.log 2>/dev/null || \
-                docker exec ${CONTAINER_NAME} find /var/lib/mysql -name "*.err" -exec cat {} \; 2>/dev/null
-            fi
+            fix_mysql
+            ;;
+        start)
+            print_info "启动容器..."
+            docker start ${CONTAINER_NAME}
+            sleep 5
+            wait_for_mysql
+            docker exec ${CONTAINER_NAME} php service start 2>/dev/null || true
+            print_info "容器已启动"
+            show_access_info
             ;;
         stop)
             print_info "停止容器..."
@@ -964,21 +911,14 @@ main() {
             docker stop ${CONTAINER_NAME}
             print_info "容器已停止"
             ;;
-        start)
-            print_info "启动容器..."
-            docker start ${CONTAINER_NAME}
-            sleep 5
-            docker exec ${CONTAINER_NAME} php service start
-            print_info "容器已启动"
-            show_access_info
-            ;;
         restart)
             print_info "重启容器..."
             docker exec ${CONTAINER_NAME} php service stop 2>/dev/null || true
             sleep 2
             docker restart ${CONTAINER_NAME}
             sleep 5
-            docker exec ${CONTAINER_NAME} php service start
+            wait_for_mysql
+            docker exec ${CONTAINER_NAME} php service start 2>/dev/null || true
             print_info "容器已重启"
             ;;
         logs)
@@ -986,49 +926,38 @@ main() {
             ;;
         shell)
             print_info "进入容器 shell..."
-            docker exec -it ${CONTAINER_NAME} /bin/ash
+            docker exec -it ${CONTAINER_NAME} /bin/sh
             ;;
         *)
-            echo "XBoard-Distro 部署脚本 - 数据保护增强版"
+            echo "XBoard-Distro 部署脚本 - 完全修复版"
             echo ""
             echo "用法: $0 {命令}"
             echo ""
             echo "部署命令:"
-            echo "  deploy       - 首次完整部署（自动检测是否需要初始化）"
-            echo "  redeploy     - 重新部署（保留所有现有数据）"
+            echo "  deploy       - 首次完整部署"
+            echo "  redeploy     - 重新部署（保留数据）"
             echo ""
             echo "管理命令:"
-            echo "  status       - 查看运行状态和数据情况"
-            echo "  verify       - 验证数据完整性（检查用户、订单等）"
-            echo "  diagnose     - 诊断系统问题（MySQL、服务等）"
-            echo "  fix-mysql    - 自动修复 MySQL 启动问题"
-            echo "  start        - 启动容器和服务"
-            echo "  stop         - 停止容器和服务"
-            echo "  restart      - 重启容器和服务"
-            echo "  reset-admin  - 仅重置管理员（不影响用户数据）"
+            echo "  status       - 查看运行状态"
+            echo "  diagnose     - 诊断系统问题"
+            echo "  fix-mysql    - 修复 MySQL 启动问题"
+            echo "  start        - 启动容器"
+            echo "  stop         - 停止容器"
+            echo "  restart      - 重启容器"
             echo ""
             echo "数据命令:"
             echo "  backup       - 备份所有数据"
-            echo "  restore      - 恢复数据（需指定备份文件）"
+            echo "  restore      - 恢复数据"
             echo ""
             echo "调试命令:"
-            echo "  logs         - 查看实时日志"
-            echo "  shell        - 进入容器 shell"
-            echo ""
-            echo "重要说明:"
-            echo "  • 所有用户数据、订阅、节点配置均持久化"
-            echo "  • 删除容器不会丢失任何数据"
-            echo "  • redeploy 会保留所有现有数据"
-            echo "  • reset-admin 仅重置管理员，不影响用户"
-            echo "  • 定期使用 backup 命令备份数据"
+            echo "  logs         - 查看日志"
+            echo "  shell        - 进入容器"
             echo ""
             echo "示例:"
             echo "  $0 deploy                           # 首次部署"
-            echo "  $0 redeploy                         # 重新部署（保留数据）"
-            echo "  $0 reset-admin                      # 重置管理员密码"
+            echo "  $0 diagnose                         # 诊断问题"
+            echo "  $0 fix-mysql                        # 修复 MySQL"
             echo "  $0 backup                           # 备份数据"
-            echo "  $0 restore /path/to/backup.tar.gz   # 恢复数据"
-            echo "  $0 status                           # 查看状态"
             exit 1
             ;;
     esac
