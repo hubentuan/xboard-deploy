@@ -148,7 +148,18 @@ start_container() {
         ${IMAGE_NAME} /sbin/init
     
     print_info "容器启动成功，等待系统服务初始化..."
-    sleep 8
+    
+    # 等待容器完全启动
+    local wait_time=0
+    while [ $wait_time -lt 15 ]; do
+        if docker exec ${CONTAINER_NAME} test -f /sbin/init 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        wait_time=$((wait_time + 1))
+    done
+    
+    sleep 3  # 额外等待系统服务启动
     
     # 检查容器状态
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
@@ -176,20 +187,60 @@ check_database_initialized() {
 # 等待 MySQL 启动
 wait_for_mysql() {
     print_step "等待 MySQL 服务启动..."
-    local max_attempts=30
+    local max_attempts=60  # 增加到 60 次 (120秒)
     local attempt=0
     
+    echo -n "正在等待"
     while [ $attempt -lt $max_attempts ]; do
-        if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
-            print_info "MySQL 服务已就绪"
-            return 0
+        # 检查 MySQL 进程是否存在
+        if docker exec ${CONTAINER_NAME} ps aux 2>/dev/null | grep -q "[m]ysqld"; then
+            # 进程存在，尝试连接
+            if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
+                echo ""
+                print_info "MySQL 服务已就绪 (耗时: $((attempt * 2)) 秒)"
+                return 0
+            fi
         fi
+        
         attempt=$((attempt + 1))
         echo -n "."
         sleep 2
+        
+        # 每 10 次显示提示
+        if [ $((attempt % 10)) -eq 0 ]; then
+            echo ""
+            print_info "仍在等待 MySQL 启动... ($((attempt * 2))/$((max_attempts * 2)) 秒)"
+            
+            # 显示 MySQL 日志的最后几行
+            if [ $attempt -eq 20 ]; then
+                echo ""
+                print_warn "MySQL 启动时间较长，查看日志:"
+                docker exec ${CONTAINER_NAME} tail -10 /var/log/mysql/error.log 2>/dev/null || \
+                docker exec ${CONTAINER_NAME} tail -10 /var/lib/mysql/*.err 2>/dev/null || \
+                echo "  无法读取 MySQL 日志"
+                echo ""
+            fi
+        fi
     done
     
-    print_error "MySQL 启动超时"
+    echo ""
+    print_error "MySQL 启动超时 (已等待 $((max_attempts * 2)) 秒)"
+    print_error "请检查容器日志: docker logs ${CONTAINER_NAME}"
+    
+    # 显示详细错误信息
+    echo ""
+    print_warn "尝试手动诊断:"
+    echo "1. 查看容器日志:"
+    echo "   docker logs ${CONTAINER_NAME}"
+    echo ""
+    echo "2. 进入容器检查:"
+    echo "   docker exec -it ${CONTAINER_NAME} /bin/ash"
+    echo "   ps aux | grep mysql"
+    echo ""
+    echo "3. 查看 MySQL 日志:"
+    echo "   docker exec ${CONTAINER_NAME} tail -50 /var/log/mysql/error.log"
+    echo ""
+    
     return 1
 }
 
@@ -205,12 +256,73 @@ check_database_tables() {
     fi
 }
 
+# 手动启动 MySQL
+manual_start_mysql() {
+    print_step "尝试手动启动 MySQL 服务..."
+    
+    # 检查容器是否运行
+    if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        print_error "容器未运行"
+        exit 1
+    fi
+    
+    # 检查 MySQL 是否已在运行
+    if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
+        print_info "MySQL 已在运行"
+        return 0
+    fi
+    
+    # 尝试不同的启动方式
+    print_info "方法1: 使用 service 命令启动..."
+    docker exec ${CONTAINER_NAME} service mysql start 2>/dev/null || \
+    docker exec ${CONTAINER_NAME} service mysqld start 2>/dev/null || \
+    docker exec ${CONTAINER_NAME} /etc/init.d/mysql start 2>/dev/null || \
+    docker exec ${CONTAINER_NAME} /etc/init.d/mysqld start 2>/dev/null
+    
+    sleep 5
+    
+    if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
+        print_info "MySQL 启动成功"
+        return 0
+    fi
+    
+    print_info "方法2: 直接启动 mysqld..."
+    docker exec -d ${CONTAINER_NAME} mysqld --user=mysql --datadir=/var/lib/mysql 2>/dev/null || \
+    docker exec -d ${CONTAINER_NAME} /usr/sbin/mysqld --user=mysql 2>/dev/null
+    
+    sleep 5
+    
+    if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
+        print_info "MySQL 启动成功"
+        return 0
+    fi
+    
+    print_error "MySQL 手动启动失败"
+    print_warn "请查看日志: docker exec ${CONTAINER_NAME} tail -50 /var/log/mysql/error.log"
+    return 1
+}
+
 # 初始化服务（仅首次）
 init_service() {
     local init_flag="${DATA_ROOT}/.initialized"
     
     # 等待 MySQL 启动
-    wait_for_mysql || exit 1
+    if ! wait_for_mysql; then
+        print_warn "MySQL 自动启动失败，尝试手动启动..."
+        if ! manual_start_mysql; then
+            print_error "MySQL 启动完全失败，无法继续"
+            echo ""
+            print_warn "故障排除步骤:"
+            echo "1. 查看容器状态: docker ps -a"
+            echo "2. 查看容器日志: docker logs ${CONTAINER_NAME}"
+            echo "3. 进入容器检查: docker exec -it ${CONTAINER_NAME} /bin/ash"
+            echo "4. 检查数据目录权限: ls -la ${DATA_ROOT}/mysql"
+            echo "5. 尝试删除数据重新初始化:"
+            echo "   rm -rf ${DATA_ROOT}/mysql/*"
+            echo "   $0 deploy"
+            exit 1
+        fi
+    fi
     
     # 检查数据库是否已初始化（检查数据库表，不仅仅是文件）
     if check_database_initialized && check_database_tables; then
@@ -693,6 +805,64 @@ main() {
         status)
             show_status
             ;;
+        verify)
+            verify_data
+            ;;
+        diagnose)
+            print_step "诊断 XBoard-Distro..."
+            echo ""
+            
+            # 检查容器
+            if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+                print_info "✓ 容器运行中"
+            else
+                print_error "✗ 容器未运行"
+                exit 1
+            fi
+            
+            # 检查 MySQL 进程
+            echo ""
+            print_step "检查 MySQL 进程..."
+            docker exec ${CONTAINER_NAME} ps aux | grep -E "[m]ysql" || echo "未找到 MySQL 进程"
+            
+            # 检查 MySQL 连接
+            echo ""
+            print_step "测试 MySQL 连接..."
+            if docker exec ${CONTAINER_NAME} mysqladmin ping -h localhost --silent 2>/dev/null; then
+                print_info "✓ MySQL 连接正常"
+            else
+                print_error "✗ MySQL 连接失败"
+                
+                print_step "尝试手动启动 MySQL..."
+                manual_start_mysql
+            fi
+            
+            # 检查数据目录
+            echo ""
+            print_step "检查数据目录..."
+            echo "MySQL 数据目录:"
+            docker exec ${CONTAINER_NAME} ls -lh /var/lib/mysql 2>/dev/null || echo "无法访问"
+            
+            # 检查日志
+            echo ""
+            print_step "最近的 MySQL 日志:"
+            docker exec ${CONTAINER_NAME} tail -20 /var/log/mysql/error.log 2>/dev/null || \
+            docker exec ${CONTAINER_NAME} tail -20 /var/lib/mysql/*.err 2>/dev/null || \
+            echo "无法读取 MySQL 日志"
+            
+            # 检查端口
+            echo ""
+            print_step "检查端口监听..."
+            docker exec ${CONTAINER_NAME} netstat -tuln 2>/dev/null | grep -E "3306|16443|443|4443" || \
+            docker exec ${CONTAINER_NAME} ss -tuln 2>/dev/null | grep -E "3306|16443|443|4443" || \
+            echo "无法获取端口信息"
+            
+            # 检查服务
+            echo ""
+            print_step "检查所有服务..."
+            docker exec ${CONTAINER_NAME} ps aux | head -20
+            
+            ;;
         stop)
             print_info "停止容器..."
             docker exec ${CONTAINER_NAME} php service stop 2>/dev/null || true
@@ -735,6 +905,7 @@ main() {
             echo ""
             echo "管理命令:"
             echo "  status       - 查看运行状态和数据情况"
+            echo "  verify       - 验证数据完整性（检查用户、订单等）"
             echo "  start        - 启动容器和服务"
             echo "  stop         - 停止容器和服务"
             echo "  restart      - 重启容器和服务"
